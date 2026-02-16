@@ -1,7 +1,6 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import pandas_datareader.data as pdr
 import statsmodels.api as sm
 from statsmodels.stats.stattools import durbin_watson
 from statsmodels.stats.diagnostic import het_breuschpagan
@@ -9,12 +8,94 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 import matplotlib.pyplot as plt
 import seaborn as sns
 import datetime
+import io
+import zipfile
+import requests
 
 # Configure matplotlib for professional-looking plots
 plt.style.use('seaborn-v0_8-darkgrid')
 sns.set_palette('deep')
 
 # --- Core Data Retrieval and Regression Functions ---
+
+
+def load_ff3_monthly_factors(start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    Load Ken French F-F Research Data Factors (Monthly) directly from Dartmouth.
+    Returns decimals (not percent) with columns: Mkt_RF, SMB, HML, RF.
+    """
+    url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        # Usually contains a single CSV file
+        csv_name = [n for n in zf.namelist() if n.lower().endswith(".csv")][0]
+        raw = zf.read(csv_name).decode("latin-1").splitlines()
+
+    # Find start of monthly table (line after the header rows)
+    # The file typically has a few header lines, then:
+    # " 192607   2.96  -2.30  -2.87   0.22"
+    # and later " Annual Factors: January-December "
+    start_idx = None
+    end_idx = None
+
+    for i, line in enumerate(raw):
+        if line.strip().startswith("1926") or line.strip().startswith("1927"):
+            start_idx = i
+            break
+
+    for i, line in enumerate(raw):
+        if "Annual Factors" in line:
+            end_idx = i
+            break
+
+    if start_idx is None or end_idx is None or end_idx <= start_idx:
+        raise ValueError("Could not parse Ken French factor file format.")
+
+    data_lines = raw[start_idx:end_idx]
+
+    rows = []
+    for line in data_lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # Split on comma if present, else whitespace
+        parts = [p.strip()
+                 for p in (line.split(",") if "," in line else line.split())]
+
+        # Need at least YYYYMM + 4 factor columns
+        if len(parts) < 5:
+            continue
+
+        yyyymm = parts[0]
+
+        # Keep only true monthly rows like "192607"
+        if not (yyyymm.isdigit() and len(yyyymm) == 6):
+            continue
+
+        rows.append(parts[:5])
+
+    df = pd.DataFrame(rows, columns=["YYYYMM", "Mkt_RF", "SMB", "HML", "RF"])
+
+    # Convert to numeric (coerce bad values to NaN) then drop any incomplete rows
+    for c in ["Mkt_RF", "SMB", "HML", "RF"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna()
+
+    # Convert YYYYMM to month-end timestamp
+    df["Date"] = pd.to_datetime(df["YYYYMM"], format="%Y%m")
+    df["Date"] = df["Date"].dt.to_period("M").dt.to_timestamp("M")
+    df = df.drop(columns=["YYYYMM"]).set_index("Date")
+
+    # Percent -> decimal
+    df = df / 100.0
+
+    # Filter date range
+    df = df.loc[pd.to_datetime(start_date):pd.to_datetime(end_date)]
+    return df
+
 
 def retrieve_and_merge_data(tickers: list, start_date: str, end_date: str) -> pd.DataFrame:
     """
@@ -30,31 +111,43 @@ def retrieve_and_merge_data(tickers: list, start_date: str, end_date: str) -> pd
         pd.DataFrame: Merged DataFrame with excess returns for stocks and
                       Fama-French factors (Mkt-RF, SMB, HML).
     """
-    print("--- Retrieving Fama-French Factors ---")
-    ff_data = pdr.DataReader('F-F_Research_Data_Factors', 'famafrench',
-                             start=start_date, end=end_date)[0]
-
-    ff_data = ff_data / 100
-    ff_data.index = ff_data.index.to_timestamp()
-    ff_data.index.name = 'Date'
-    ff_data = ff_data.rename(columns={'Mkt-RF': 'Mkt_RF'})
+    print("--- Retrieving Fama-French Factors (Ken French) ---")
+    ff_data = load_ff3_monthly_factors(start_date, end_date)
 
     print("--- Retrieving Stock Returns ---")
-    stock_prices = yf.download(tickers, start=start_date, end=end_date, interval='1mo')['Close']
+    stock_prices = yf.download(
+        tickers,
+        start=start_date,
+        end=end_date,
+        auto_adjust=True,
+        progress=False,
+    )["Close"]
+
+    # If single ticker, yfinance returns a Series -> convert to DataFrame
+    if isinstance(stock_prices, pd.Series):
+        stock_prices = stock_prices.to_frame(name=tickers[0])
+
+    # Convert daily prices -> month-end prices to match Ken French month-end dating
+    stock_prices = stock_prices.resample("M").last()
+
     stock_returns = stock_prices.pct_change().dropna()
-    stock_returns.index.name = 'Date'
+    stock_returns.index.name = "Date"
 
     print("--- Merging Data ---")
     merged_data = stock_returns.join(ff_data, how='inner')
 
     for ticker in tickers:
-        merged_data[f'{ticker}_excess'] = merged_data[ticker] - merged_data['RF']
+        merged_data[f'{ticker}_excess'] = merged_data[ticker] - \
+            merged_data['RF']
 
-    columns_for_analysis = [f'{t}_excess' for t in tickers] + ['Mkt_RF', 'SMB', 'HML'] + ['RF']
+    columns_for_analysis = [
+        f'{t}_excess' for t in tickers] + ['Mkt_RF', 'SMB', 'HML'] + ['RF']
     merged_data = merged_data[columns_for_analysis].dropna()
 
-    print(f"Merged dataset shape: {merged_data.shape[0]} months, {merged_data.shape[1]} columns.")
+    print(
+        f"Merged dataset shape: {merged_data.shape[0]} months, {merged_data.shape[1]} columns.")
     return merged_data
+
 
 def run_capm_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
     """
@@ -68,7 +161,7 @@ def run_capm_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
         dict: A dictionary containing CAPM regression results including the model object.
     """
     y = df[f'{stock_ticker}_excess']
-    X = sm.add_constant(df['Mkt_RF']) # Add constant for alpha
+    X = sm.add_constant(df['Mkt_RF'])  # Add constant for alpha
 
     model = sm.OLS(y, X).fit()
 
@@ -95,6 +188,7 @@ def run_capm_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
         'information_ratio': info_ratio
     }
 
+
 def run_ff3_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
     """
     Runs Fama-French 3-factor regression for a given stock and extracts key metrics.
@@ -107,7 +201,7 @@ def run_ff3_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
         dict: A dictionary containing FF3 regression results including the model object.
     """
     y = df[f'{stock_ticker}_excess']
-    X = sm.add_constant(df[['Mkt_RF', 'SMB', 'HML']]) # Add constant for alpha
+    X = sm.add_constant(df[['Mkt_RF', 'SMB', 'HML']])  # Add constant for alpha
 
     model = sm.OLS(y, X).fit()
 
@@ -145,6 +239,7 @@ def run_ff3_regression(df: pd.DataFrame, stock_ticker: str) -> dict:
         'information_ratio': info_ratio
     }
 
+
 def run_diagnostic_tests(model: sm.regression.linear_model.RegressionResultsWrapper, X_df: pd.DataFrame) -> dict:
     """
     Performs diagnostic tests for an OLS regression model.
@@ -169,8 +264,10 @@ def run_diagnostic_tests(model: sm.regression.linear_model.RegressionResultsWrap
     else:
         # If only constant or single factor, VIF is not typically interpreted for multicollinearity
         # or it's 1 for a single factor.
-        if 'Mkt_RF' in X_df.columns and X_df.shape[1] == 2: # Likely CAPM with const + Mkt_RF
-            vif_results['Mkt_RF'] = 1.0 # VIF is 1 for a single independent variable
+        # Likely CAPM with const + Mkt_RF
+        if 'Mkt_RF' in X_df.columns and X_df.shape[1] == 2:
+            # VIF is 1 for a single independent variable
+            vif_results['Mkt_RF'] = 1.0
         else:
             vif_results['No_Applicable_Factors_for_VIF'] = np.nan
 
@@ -188,6 +285,7 @@ def run_diagnostic_tests(model: sm.regression.linear_model.RegressionResultsWrap
         'vif_results': vif_results,
         'vif_interpretation': vif_interpretation
     }
+
 
 def calculate_rolling_betas(df: pd.DataFrame, stock_ticker: str, window_size: int = 36) -> pd.DataFrame:
     """
@@ -208,7 +306,7 @@ def calculate_rolling_betas(df: pd.DataFrame, stock_ticker: str, window_size: in
     X_cols = ['Mkt_RF', 'SMB', 'HML']
 
     for i in range(window_size - 1, len(df)):
-        window_df = df.iloc[i - window_size + 1 : i + 1]
+        window_df = df.iloc[i - window_size + 1: i + 1]
 
         y_roll = window_df[y_col]
         X_roll = sm.add_constant(window_df[X_cols])
@@ -217,15 +315,20 @@ def calculate_rolling_betas(df: pd.DataFrame, stock_ticker: str, window_size: in
             try:
                 model_roll = sm.OLS(y_roll, X_roll).fit()
                 if all(col in model_roll.params for col in X_cols):
-                    rolling_betas.loc[df.index[i], ['Beta_M', 'Beta_S', 'Beta_H']] = model_roll.params[X_cols].values
+                    rolling_betas.loc[df.index[i], [
+                        'Beta_M', 'Beta_S', 'Beta_H']] = model_roll.params[X_cols].values
                 else:
-                    rolling_betas.loc[df.index[i], ['Beta_M', 'Beta_S', 'Beta_H']] = np.nan
+                    rolling_betas.loc[df.index[i], [
+                        'Beta_M', 'Beta_S', 'Beta_H']] = np.nan
             except (ValueError, np.linalg.LinAlgError):
-                rolling_betas.loc[df.index[i], ['Beta_M', 'Beta_S', 'Beta_H']] = np.nan
+                rolling_betas.loc[df.index[i], [
+                    'Beta_M', 'Beta_S', 'Beta_H']] = np.nan
         else:
-            rolling_betas.loc[df.index[i], ['Beta_M', 'Beta_S', 'Beta_H']] = np.nan
+            rolling_betas.loc[df.index[i], [
+                'Beta_M', 'Beta_S', 'Beta_H']] = np.nan
 
     return rolling_betas.astype(float)
+
 
 def project_returns_under_scenarios(ff3_model_params: pd.Series, scenarios: dict) -> pd.DataFrame:
     """
@@ -253,18 +356,21 @@ def project_returns_under_scenarios(ff3_model_params: pd.Series, scenarios: dict
                            beta_H * factor_returns.get('HML', 0))
 
         exp_ret_annual = exp_ret_monthly * 12
-        projected_returns_data.append({'Scenario': scenario_name, 'Projected_Annual_Excess_Return': exp_ret_annual})
+        projected_returns_data.append(
+            {'Scenario': scenario_name, 'Projected_Annual_Excess_Return': exp_ret_annual})
 
     return pd.DataFrame(projected_returns_data)
 
 # --- Plotting Helper Functions ---
+
 
 def plot_data_alignment(df: pd.DataFrame, stock_ticker: str):
     """
     Plots a sample of stock excess return vs. market excess return to verify data alignment.
     """
     plt.figure(figsize=(12, 6))
-    plt.plot(df.index, df[f'{stock_ticker}_excess'], label=f'{stock_ticker} Excess Return')
+    plt.plot(df.index, df[f'{stock_ticker}_excess'],
+             label=f'{stock_ticker} Excess Return')
     plt.plot(df.index, df['Mkt_RF'], label='Market Excess Return (Mkt-RF)')
     plt.title(f'{stock_ticker} Excess Return vs. Market Excess Return Over Time')
     plt.xlabel('Date')
@@ -272,6 +378,7 @@ def plot_data_alignment(df: pd.DataFrame, stock_ticker: str):
     plt.legend()
     plt.tight_layout()
     plt.show()
+
 
 def plot_factor_betas_comparison(tickers: list, ff3_results: dict):
     """
@@ -284,7 +391,8 @@ def plot_factor_betas_comparison(tickers: list, ff3_results: dict):
         'Beta_H': [ff3_results[s]['beta_H'] for s in tickers]
     })
 
-    betas_melted = betas_df.melt(id_vars='Stock', var_name='Factor', value_name='Beta')
+    betas_melted = betas_df.melt(
+        id_vars='Stock', var_name='Factor', value_name='Beta')
 
     plt.figure(figsize=(14, 7))
     sns.barplot(x='Stock', y='Beta', hue='Factor', data=betas_melted)
@@ -295,6 +403,7 @@ def plot_factor_betas_comparison(tickers: list, ff3_results: dict):
     plt.legend(title='Factor', bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
+
 
 def plot_sml_analysis(df_merged: pd.DataFrame, tickers: list, ff3_results: dict):
     """
@@ -312,49 +421,67 @@ def plot_sml_analysis(df_merged: pd.DataFrame, tickers: list, ff3_results: dict)
     df_sml = pd.DataFrame(sml_data)
 
     avg_mkt_rf = df_merged['Mkt_RF'].mean()
-    theoretical_sml_x = np.linspace(df_sml['Market_Beta'].min() * 0.8, df_sml['Market_Beta'].max() * 1.2, 100)
+    theoretical_sml_x = np.linspace(
+        df_sml['Market_Beta'].min() * 0.8, df_sml['Market_Beta'].max() * 1.2, 100)
     theoretical_sml_y = theoretical_sml_x * avg_mkt_rf * 12
 
     plt.figure(figsize=(12, 7))
-    sns.scatterplot(x='Market_Beta', y='Avg_Excess_Return', hue='Stock', data=df_sml.mul(12), s=100, zorder=2) # Annualize for plot
-    plt.plot(theoretical_sml_x, theoretical_sml_y, color='red', linestyle='--', label=f'Theoretical SML (E[Mkt-RF] Ann: {avg_mkt_rf*12:.2%})')
-    plt.title('Security Market Line (SML) Plot: Annualized Excess Returns vs. Market Beta')
+    df_sml_plot = df_sml.copy()
+    df_sml_plot["Avg_Excess_Return_Ann"] = df_sml_plot["Avg_Excess_Return"] * 12
+
+    sns.scatterplot(
+        x="Market_Beta",
+        y="Avg_Excess_Return_Ann",
+        hue="Stock",
+        data=df_sml_plot,
+        s=100,
+        zorder=2,
+    )
+
+    plt.plot(theoretical_sml_x, theoretical_sml_y, color='red', linestyle='--',
+             label=f'Theoretical SML (E[Mkt-RF] Ann: {avg_mkt_rf*12:.2%})')
+    plt.title(
+        'Security Market Line (SML) Plot: Annualized Excess Returns vs. Market Beta')
     plt.xlabel(r'Market Beta ($\beta_M$)')
     plt.ylabel('Annualized Average Excess Return')
     plt.axhline(0, color='gray', linestyle='--', alpha=0.7)
-    plt.axvline(1, color='gray', linestyle=':', alpha=0.7, label='Market Beta = 1')
+    plt.axvline(1, color='gray', linestyle=':',
+                alpha=0.7, label='Market Beta = 1')
     plt.legend()
     plt.tight_layout()
     plt.show()
+
 
 def plot_regression_diagnostics(ff3_model: sm.regression.linear_model.RegressionResultsWrapper, stock_ticker: str):
     """
     Generates a 4-panel diagnostic plot for an OLS regression model's residuals.
     """
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    fig.suptitle(f'Regression Diagnostic Plots for {stock_ticker} (Fama-French 3-Factor Model)', fontsize=16)
+    fig.suptitle(
+        f'Regression Diagnostic Plots for {stock_ticker} (Fama-French 3-Factor Model)', fontsize=16)
 
-    axes[0,0].plot(ff3_model.resid.index, ff3_model.resid)
-    axes[0,0].axhline(y=0, color='red', linestyle='--')
-    axes[0,0].set_title('Residuals Over Time')
-    axes[0,0].set_ylabel('Residual Value')
+    axes[0, 0].plot(ff3_model.resid.index, ff3_model.resid)
+    axes[0, 0].axhline(y=0, color='red', linestyle='--')
+    axes[0, 0].set_title('Residuals Over Time')
+    axes[0, 0].set_ylabel('Residual Value')
 
-    axes[0,1].scatter(ff3_model.fittedvalues, ff3_model.resid, alpha=0.5)
-    axes[0,1].axhline(y=0, color='red', linestyle='--')
-    axes[0,1].set_title('Residuals vs Fitted Values')
-    axes[0,1].set_xlabel('Fitted Values')
-    axes[0,1].set_ylabel('Residual Value')
+    axes[0, 1].scatter(ff3_model.fittedvalues, ff3_model.resid, alpha=0.5)
+    axes[0, 1].axhline(y=0, color='red', linestyle='--')
+    axes[0, 1].set_title('Residuals vs Fitted Values')
+    axes[0, 1].set_xlabel('Fitted Values')
+    axes[0, 1].set_ylabel('Residual Value')
 
-    sm.qqplot(ff3_model.resid, line='45', ax=axes[1,0])
-    axes[1,0].set_title('Q-Q Plot of Residuals')
+    sm.qqplot(ff3_model.resid, line='45', ax=axes[1, 0])
+    axes[1, 0].set_title('Q-Q Plot of Residuals')
 
-    axes[1,1].hist(ff3_model.resid, bins=30, edgecolor='black', alpha=0.7)
-    axes[1,1].set_title('Residual Distribution')
-    axes[1,1].set_xlabel('Residual Value')
-    axes[1,1].set_ylabel('Frequency')
+    axes[1, 1].hist(ff3_model.resid, bins=30, edgecolor='black', alpha=0.7)
+    axes[1, 1].set_title('Residual Distribution')
+    axes[1, 1].set_xlabel('Residual Value')
+    axes[1, 1].set_ylabel('Frequency')
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
+
 
 def plot_rolling_betas_chart(rolling_betas_df: pd.DataFrame, stock_ticker: str, window_size: int):
     """
@@ -364,16 +491,19 @@ def plot_rolling_betas_chart(rolling_betas_df: pd.DataFrame, stock_ticker: str, 
     plt.figure(figsize=(14, 7))
     rolling_betas_df.plot(ax=plt.gca())
 
-    plt.title(f'Rolling {window_size}-Month Fama-French Factor Betas for {stock_ticker}')
+    plt.title(
+        f'Rolling {window_size}-Month Fama-French Factor Betas for {stock_ticker}')
     plt.xlabel('Date')
     plt.ylabel('Beta Value')
     plt.axhline(0, color='gray', linestyle='--', alpha=0.5)
     plt.axhline(1, color='gray', linestyle='--', alpha=0.5)
 
     if not rolling_betas_df.empty:
-        min_date = rolling_betas_df.index.min().to_pydatetime().date() # Convert to date for comparison
-        max_date = rolling_betas_df.index.max().to_pydatetime().date() # Convert to date for comparison
-        
+        # Convert to date for comparison
+        min_date = rolling_betas_df.index.min().to_pydatetime().date()
+        # Convert to date for comparison
+        max_date = rolling_betas_df.index.max().to_pydatetime().date()
+
         # Ensure the annotation dates are within the actual plot's date range
         if min_date <= datetime.date(2020, 2, 1) and max_date >= datetime.date(2020, 4, 1):
             plt.axvspan(datetime.datetime(2020, 2, 1), datetime.datetime(2020, 4, 1),
@@ -385,6 +515,7 @@ def plot_rolling_betas_chart(rolling_betas_df: pd.DataFrame, stock_ticker: str, 
     plt.legend(title='Factor', bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
+
 
 def plot_cumulative_return_decomposition(df: pd.DataFrame, ff3_model_params: pd.Series, stock_ticker: str):
     """
@@ -408,7 +539,8 @@ def plot_cumulative_return_decomposition(df: pd.DataFrame, ff3_model_params: pd.
     hml_contribution = beta_H * X['HML']
     alpha_contribution = pd.Series(alpha, index=df.index)
 
-    total_model_return = market_contribution + smb_contribution + hml_contribution + alpha_contribution
+    total_model_return = market_contribution + \
+        smb_contribution + hml_contribution + alpha_contribution
     epsilon_contribution = y - total_model_return
 
     attribution_df = pd.DataFrame({
@@ -424,14 +556,17 @@ def plot_cumulative_return_decomposition(df: pd.DataFrame, ff3_model_params: pd.
     attribution_df[['Market Factor', 'SMB Factor', 'HML Factor', 'Alpha', 'Residual (Unexplained)']].plot(
         kind='line', ax=plt.gca(), alpha=0.7, linewidth=2
     )
-    attribution_df['Actual Excess Return'].plot(ax=plt.gca(), color='black', linestyle='--', linewidth=2, label='Actual Excess Return')
+    attribution_df['Actual Excess Return'].plot(ax=plt.gca(
+    ), color='black', linestyle='--', linewidth=2, label='Actual Excess Return')
 
-    plt.title(f'Cumulative Return Decomposition for {stock_ticker} (Fama-French 3-Factor Model)')
+    plt.title(
+        f'Cumulative Return Decomposition for {stock_ticker} (Fama-French 3-Factor Model)')
     plt.xlabel('Date')
     plt.ylabel('Cumulative Return')
     plt.legend(title='Component', bbox_to_anchor=(1.05, 1), loc='upper left')
     plt.tight_layout()
     plt.show()
+
 
 def plot_predicted_vs_actual(df: pd.DataFrame, ff3_model: sm.regression.linear_model.RegressionResultsWrapper, stock_ticker: str):
     """
@@ -459,6 +594,7 @@ def plot_predicted_vs_actual(df: pd.DataFrame, ff3_model: sm.regression.linear_m
     plt.show()
 
 # --- Summary Table Helper Functions ---
+
 
 def create_comparative_summary_table(tickers: list, capm_results: dict, ff3_results: dict) -> pd.DataFrame:
     """
@@ -488,18 +624,21 @@ def create_comparative_summary_table(tickers: list, capm_results: dict, ff3_resu
         })
     return pd.DataFrame(summary_data).set_index('Stock')
 
+
 def create_scenario_summary_table(scenario_projections: dict) -> pd.DataFrame:
     """
     Combines scenario projection results for all stocks into a single DataFrame.
     """
     all_projections_df = pd.DataFrame()
     for stock, projections in scenario_projections.items():
-        projections_indexed = projections.set_index('Scenario').rename(columns={'Projected_Annual_Excess_Return': stock})
+        projections_indexed = projections.set_index('Scenario').rename(
+            columns={'Projected_Annual_Excess_Return': stock})
         if all_projections_df.empty:
             all_projections_df = projections_indexed
         else:
             all_projections_df = all_projections_df.join(projections_indexed)
     return all_projections_df.applymap(lambda x: f"{x:.2%}")
+
 
 def create_final_report_table(tickers: list, capm_results: dict, ff3_results: dict, diagnostic_results: dict) -> pd.DataFrame:
     """
@@ -512,7 +651,8 @@ def create_final_report_table(tickers: list, capm_results: dict, ff3_results: di
         diag_r = diagnostic_results[stock]
 
         r_squared_improvement = ff3_r['r_squared'] - capm_r['r_squared']
-        vifs_str = ", ".join([f"{k}: {v:.2f}" for k, v in diag_r['vif_results'].items() if not np.isnan(v)])
+        vifs_str = ", ".join(
+            [f"{k}: {v:.2f}" for k, v in diag_r['vif_results'].items() if not np.isnan(v)])
 
         final_summary_data.append({
             'Stock': stock,
@@ -531,16 +671,26 @@ def create_final_report_table(tickers: list, capm_results: dict, ff3_results: di
 
     df_final_report = pd.DataFrame(final_summary_data).set_index('Stock')
     df_final_report_formatted = df_final_report.copy()
-    df_final_report_formatted['FF3_Alpha_Ann (%)'] = df_final_report_formatted['FF3_Alpha_Ann (%)'].map('{:.2f}%'.format)
-    df_final_report_formatted['FF3_Alpha_pvalue'] = df_final_report_formatted['FF3_Alpha_pvalue'].map('{:.3f}'.format)
-    df_final_report_formatted['FF3_Beta_M'] = df_final_report_formatted['FF3_Beta_M'].map('{:.3f}'.format)
-    df_final_report_formatted['FF3_Beta_S'] = df_final_report_formatted['FF3_Beta_S'].map('{:.3f}'.format)
-    df_final_report_formatted['FF3_Beta_H'] = df_final_report_formatted['FF3_Beta_H'].map('{:.3f}'.format)
-    df_final_report_formatted['FF3_R_squared'] = df_final_report_formatted['FF3_R_squared'].map('{:.3f}'.format)
-    df_final_report_formatted['R2_Improvement (FF3-CAPM)'] = df_final_report_formatted['R2_Improvement (FF3-CAPM)'].map('{:.3f}'.format)
-    df_final_report_formatted['FF3_IR'] = df_final_report_formatted['FF3_IR'].map('{:.3f}'.format)
-    df_final_report_formatted['DW_Stat'] = df_final_report_formatted['DW_Stat'].map('{:.3f}'.format)
-    df_final_report_formatted['BP_Pvalue'] = df_final_report_formatted['BP_Pvalue'].map('{:.4f}'.format)
+    df_final_report_formatted['FF3_Alpha_Ann (%)'] = df_final_report_formatted['FF3_Alpha_Ann (%)'].map(
+        '{:.2f}%'.format)
+    df_final_report_formatted['FF3_Alpha_pvalue'] = df_final_report_formatted['FF3_Alpha_pvalue'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['FF3_Beta_M'] = df_final_report_formatted['FF3_Beta_M'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['FF3_Beta_S'] = df_final_report_formatted['FF3_Beta_S'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['FF3_Beta_H'] = df_final_report_formatted['FF3_Beta_H'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['FF3_R_squared'] = df_final_report_formatted['FF3_R_squared'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['R2_Improvement (FF3-CAPM)'] = df_final_report_formatted['R2_Improvement (FF3-CAPM)'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['FF3_IR'] = df_final_report_formatted['FF3_IR'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['DW_Stat'] = df_final_report_formatted['DW_Stat'].map(
+        '{:.3f}'.format)
+    df_final_report_formatted['BP_Pvalue'] = df_final_report_formatted['BP_Pvalue'].map(
+        '{:.4f}'.format)
     return df_final_report_formatted
 
 
@@ -577,7 +727,7 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
               - 'df_final_report': Comprehensive final report table.
     """
     print("--- Starting Factor Analysis ---")
-    
+
     results = {}
 
     # 1. Data Retrieval and Merging
@@ -586,7 +736,8 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
     print("\nFirst 5 rows of the merged data:")
     print(df_merged.head())
     if show_plots and not df_merged.empty:
-        plot_data_alignment(df_merged, tickers[0]) # Plot a sample for the first ticker
+        # Plot a sample for the first ticker
+        plot_data_alignment(df_merged, tickers[0])
 
     # 2. Run CAPM Regression for all stocks
     capm_results = {}
@@ -597,12 +748,14 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
         capm_results[stock] = res
         print(res['model'].summary())
         print(f"\nCAPM Results for {stock}:")
-        print(f"  Alpha (monthly): {res['alpha']:.4f} ({res['alpha_ann']:.2%} annualized)")
+        print(
+            f"  Alpha (monthly): {res['alpha']:.4f} ({res['alpha_ann']:.2%} annualized)")
         print(f"  Alpha p-value: {res['alpha_pval']:.4f}")
         print(f"  Beta (Market): {res['beta_M']:.3f}")
         print(f"  Beta p-value: {res['beta_M_pval']:.4f}")
         print(f"  R-squared: {res['r_squared']:.3f}")
-        print(f"  Annualized Residual Std Dev (Tracking Error): {res['resid_std_ann']:.3f}")
+        print(
+            f"  Annualized Residual Std Dev (Tracking Error): {res['resid_std_ann']:.3f}")
         print(f"  Information Ratio: {res['information_ratio']:.3f}")
     results['capm_results'] = capm_results
 
@@ -618,7 +771,8 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
 
     # 4. Comparative Analysis Table (CAPM vs FF3)
     print("\n--- Comparative Factor Exposure & Performance Table (CAPM vs. FF3) ---")
-    df_capm_ff3_summary = create_comparative_summary_table(tickers, capm_results, ff3_results)
+    df_capm_ff3_summary = create_comparative_summary_table(
+        tickers, capm_results, ff3_results)
     print(df_capm_ff3_summary)
     results['df_capm_ff3_summary'] = df_capm_ff3_summary
 
@@ -634,13 +788,17 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
     diagnostic_results = {}
     print("\n--- Running Diagnostic Tests for Fama-French 3-Factor Models ---")
     for stock in tickers:
-        print(f"\n--- Diagnostic Tests for {stock}'s Fama-French 3-Factor Model ---")
+        print(
+            f"\n--- Diagnostic Tests for {stock}'s Fama-French 3-Factor Model ---")
         ff3_model = ff3_results[stock]['model']
         X_ff3 = sm.add_constant(df_merged[['Mkt_RF', 'SMB', 'HML']])
-        res = run_diagnostic_tests(ff3_model, X_ff3) # Removed stock_ticker from args
+        # Removed stock_ticker from args
+        res = run_diagnostic_tests(ff3_model, X_ff3)
         diagnostic_results[stock] = res
-        print(f"  Durbin-Watson statistic: {res['dw_stat']:.3f} - {res['dw_interpretation']}")
-        print(f"  Breusch-Pagan p-value: {res['bp_pvalue']:.4f} - {res['bp_interpretation']}")
+        print(
+            f"  Durbin-Watson statistic: {res['dw_stat']:.3f} - {res['dw_interpretation']}")
+        print(
+            f"  Breusch-Pagan p-value: {res['bp_pvalue']:.4f} - {res['bp_interpretation']}")
         print(f"  VIF results: {res['vif_results']}")
         print(f"  VIF interpretation: {res['vif_interpretation']}")
         if show_plots:
@@ -648,10 +806,12 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
     results['diagnostic_results'] = diagnostic_results
 
     # 8. Calculate and Plot Rolling Betas
-    print(f"\n--- Calculating Rolling Betas (Window: {rolling_window} months) ---")
+    print(
+        f"\n--- Calculating Rolling Betas (Window: {rolling_window} months) ---")
     for stock in tickers:
         print(f"\n--- Rolling Betas for {stock} ---")
-        rolling_betas_df = calculate_rolling_betas(df_merged, stock, rolling_window)
+        rolling_betas_df = calculate_rolling_betas(
+            df_merged, stock, rolling_window)
         if show_plots:
             plot_rolling_betas_chart(rolling_betas_df, stock, rolling_window)
 
@@ -662,21 +822,23 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
         for stock in tickers:
             print(f"\n--- Scenario Projections for {stock} ---")
             ff3_model_params = ff3_results[stock]['model'].params
-            projections = project_returns_under_scenarios(ff3_model_params, macro_scenarios)
+            projections = project_returns_under_scenarios(
+                ff3_model_params, macro_scenarios)
             scenario_projections[stock] = projections
             print(f"Annualized Projected Excess Returns for {stock}:")
-            print(projections.set_index('Scenario').applymap(lambda x: f"{x:.2%}"))
+            print(projections.set_index(
+                'Scenario').applymap(lambda x: f"{x:.2%}"))
         results['scenario_projections'] = scenario_projections
 
         print("\n--- Summary of Projected Annualized Excess Returns Across All Stocks ---")
-        df_all_projections = create_scenario_summary_table(scenario_projections)
+        df_all_projections = create_scenario_summary_table(
+            scenario_projections)
         print(df_all_projections)
         results['df_all_projections'] = df_all_projections
     else:
         print("\n--- Skipping Scenario Projections (no macro_scenarios provided) ---")
         results['scenario_projections'] = None
         results['df_all_projections'] = None
-
 
     # 10. Visualizations (Cumulative Return Decomposition & Predicted vs. Actual)
     print("\n--- Generating Performance Visualizations ---")
@@ -685,22 +847,25 @@ def run_factor_analysis(tickers: list, start_date: str, end_date: str, rolling_w
         ff3_model_params = ff3_model.params
         print(f"\n--- Visualizing Performance for {stock} ---")
         if show_plots:
-            plot_cumulative_return_decomposition(df_merged, ff3_model_params, stock)
+            plot_cumulative_return_decomposition(
+                df_merged, ff3_model_params, stock)
             plot_predicted_vs_actual(df_merged, ff3_model, stock)
 
     # 11. Final Comparative Summary Table
     print("\n--- Comprehensive Factor Exposure & Performance Report ---")
-    df_final_report_formatted = create_final_report_table(tickers, capm_results, ff3_results, diagnostic_results)
+    df_final_report_formatted = create_final_report_table(
+        tickers, capm_results, ff3_results, diagnostic_results)
     print(df_final_report_formatted.to_markdown())
     results['df_final_report'] = df_final_report_formatted
 
     print("\n--- Factor Analysis Complete ---")
-    
+
     # Close all plots to free memory. For an app, this might be handled differently.
     if show_plots:
         plt.close('all')
 
     return results
+
 
 # --- Example Usage ---
 if __name__ == '__main__':
@@ -708,7 +873,7 @@ if __name__ == '__main__':
     target_stocks = ['AAPL', 'BRK-B', 'TSLA', 'JNJ']
     analysis_start_date = '2014-01-01'
     analysis_end_date = '2024-01-01'
-    rolling_window_size = 36 # 36-month rolling window
+    rolling_window_size = 36  # 36-month rolling window
 
     # Define hypothetical macroeconomic scenarios (monthly expected factor returns)
     macro_scenarios = {
@@ -727,12 +892,14 @@ if __name__ == '__main__':
         end_date=analysis_end_date,
         rolling_window=rolling_window_size,
         macro_scenarios=macro_scenarios,
-        show_plots=True # Set to False if running in a headless environment or if app handles plots
+        show_plots=True  # Set to False if running in a headless environment or if app handles plots
     )
 
     # You can now access all results via the 'analysis_results' dictionary:
     print("\n--- Accessing results after main function call (sample) ---")
     print("Merged Data Head:\n", analysis_results['df_merged'].head())
-    print("\nCAPM Results for AAPL:\n", analysis_results['capm_results']['AAPL'])
+    print("\nCAPM Results for AAPL:\n",
+          analysis_results['capm_results']['AAPL'])
     print("\nFF3 Results for AAPL:\n", analysis_results['ff3_results']['AAPL'])
-    print("\nFinal Report (Markdown):\n", analysis_results['df_final_report'].to_markdown())
+    print("\nFinal Report (Markdown):\n",
+          analysis_results['df_final_report'].to_markdown())
